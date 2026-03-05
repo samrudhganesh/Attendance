@@ -489,10 +489,16 @@ function showPage(name){
 // ══════════════════════════════════════════════
 //  FACE-API MODELS
 // ══════════════════════════════════════════════
-const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/model';
+const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights/';
 
 async function loadModels(){
   log('Loading AI face recognition models…','warn');
+  const timeout = setTimeout(()=>{
+    if(!modelsLoaded){
+      log('Model load timed out — check your internet connection and refresh','err');
+      document.getElementById('model-label').textContent = 'Load timed out — refresh page';
+    }
+  }, 30000);
   try {
     await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
     log('✓ Face detector loaded','ok');
@@ -501,11 +507,13 @@ async function loadModels(){
     await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
     log('✓ Recognition model loaded','ok');
     modelsLoaded = true;
+    clearTimeout(timeout);
     const ms = document.getElementById('model-status');
     ms.classList.add('ready');
     document.getElementById('model-label').textContent = 'AI Ready ✓';
     log('All models ready — system online','ok');
   } catch(e){
+    clearTimeout(timeout);
     log('Model load failed: '+e.message,'err');
     document.getElementById('model-label').textContent = 'Load failed — check internet';
   }
@@ -528,7 +536,13 @@ function log(msg, type=''){
 // ══════════════════════════════════════════════
 async function loadStudents(){
   students = await dbGetAll('students');
-  students.forEach(s=>{ if(s.descriptor) s.descriptor = new Float32Array(s.descriptor); });
+  students.forEach(s=>{
+    if(s.descriptor && Array.isArray(s.descriptor)){
+      s.descriptor = new Float32Array(s.descriptor);
+    } else {
+      s.descriptor = null;
+    }
+  });
   updateBadge();
 }
 
@@ -593,23 +607,35 @@ async function addStudent(){
   const file = document.getElementById('s-photo').files[0];
   if(!name||!sid){ alert('Please fill in name and ID.'); return; }
   if(!file){ alert('Please select a profile photo.'); return; }
-  if(students.find(s=>s.id===sid)){ alert('Student ID already exists.'); return; }
+  if(students.find(s=>s.id===sid)){ alert('Student ID "'+sid+'" already exists. Use a unique ID.'); return; }
+  // Also check for potential duplicate name
+  const dupName = students.find(s=>s.name.toLowerCase()===name.toLowerCase());
+  if(dupName && !confirm(`A student named "${dupName.name}" already exists. Add anyway?`)) return;
 
   // Read photo
   const photoData = await new Promise(res=>{ const r=new FileReader(); r.onload=e=>res(e.target.result); r.readAsDataURL(file); });
 
-  // Extract face descriptor if models ready
+  // Extract face descriptor — use img element, safer than faceapi.fetchImage with data URLs
   let descriptor = null;
   if(modelsLoaded){
     try {
-      const img = await faceapi.fetchImage(photoData.startsWith('data:')
-        ? photoData : URL.createObjectURL(file));
-      const det = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
-      if(det) descriptor = Array.from(det.descriptor);
-      else alert('⚠️ No face detected in photo. Student added, but face recognition won\'t work. Try a clearer photo.');
-    } catch(e){ console.warn('Face extract error',e); }
+      const imgEl = document.createElement('img');
+      imgEl.src = photoData;
+      await new Promise((res,rej)=>{ imgEl.onload=res; imgEl.onerror=rej; });
+      const det = await faceapi
+        .detectSingleFace(imgEl, new faceapi.SsdMobilenetv1Options({minConfidence:0.5}))
+        .withFaceLandmarks().withFaceDescriptor();
+      if(det){
+        descriptor = Array.from(det.descriptor); // plain Array — IndexedDB safe
+      } else {
+        alert('⚠️ No face detected in this photo.\nUse a clear, well-lit frontal face photo.\nStudent saved — re-add with a better photo for recognition to work.');
+      }
+    } catch(e){
+      console.warn('Face extract error',e);
+      alert('⚠️ Face extraction failed: '+e.message+'\nStudent saved without face data.');
+    }
   } else {
-    alert('⚠️ AI models still loading. Student added without face data. Re-open the app and add again for best results.');
+    alert('⚠️ AI models still loading. Wait for "AI Ready ✓" then delete and re-add this student.');
   }
 
   const student = { id:sid, name, photo:photoData, descriptor };
@@ -684,7 +710,7 @@ async function processAttendance(){
 
   try {
     const detections = await faceapi
-      .detectAllFaces(groupImageEl, new faceapi.SsdMobilenetv1Options({minConfidence:0.4}))
+      .detectAllFaces(groupImageEl, new faceapi.SsdMobilenetv1Options({minConfidence:0.6}))
       .withFaceLandmarks()
       .withFaceDescriptors();
 
@@ -694,7 +720,7 @@ async function processAttendance(){
     const labeledDescriptors = trained.map(s=>
       new faceapi.LabeledFaceDescriptors(s.id, [s.descriptor])
     );
-    const matcher = new faceapi.FaceMatcher(labeledDescriptors, 0.55);
+    const matcher = new faceapi.FaceMatcher(labeledDescriptors, 0.42);
 
     // Match
     const presentIds = new Set();
@@ -773,10 +799,10 @@ function renderAttList(results){
   `).join('');
 }
 
-function exportCSV(results, dateStr){
+function exportCSV(results=null, dateStr=null){
   const data = results || currentResults;
   const date = dateStr || document.getElementById('att-date').value;
-  if(!data) return;
+  if(!data){ alert('No attendance data to export.'); return; }
   const rows = [['Student ID','Name','Date','Status']];
   data.forEach(r=>{
     const s = students.find(st=>st.id===r.studentId)||{id:r.studentId};
@@ -815,7 +841,7 @@ function renderHistory(){
           <div class="s-stat"><div class="s-stat-num" style="color:var(--amber)">${pct}%</div><div class="s-stat-label">Rate</div></div>
         </div>
         <div class="session-actions">
-          <button class="btn-sm export" onclick="exportCSV(sessions.find(x=>x.id==${s.id}).results,'${s.date}')">⬇ CSV</button>
+          <button class="btn-sm export" onclick="exportCSV(sessions.find(x=>String(x.id)===String(${s.id})).results,'${s.date}')">⬇ CSV</button>
           <button class="btn-sm del" onclick="deleteSession(${s.id})">✕</button>
         </div>
       </div>
@@ -835,11 +861,15 @@ async function deleteSession(id){
 //  INIT
 // ══════════════════════════════════════════════
 async function init(){
-  await openDB();
+  try {
+    await openDB();
+  } catch(e) {
+    alert('❌ Could not open local database: '+e.message+'\nTry a different browser or clear site data.');
+    return;
+  }
   await Promise.all([loadStudents(), loadSessions()]);
   renderStudents();
   updateDash();
-  // Load models async (non-blocking)
   loadModels();
 }
 init();
